@@ -1,0 +1,234 @@
+options:
+  size: 2x
+image: python:3.7
+clone:
+  depth: full
+definitions:
+  caches:
+    sonar: ~/.sonar
+  services:
+    docker-4g:
+      type: docker
+      memory: 4096
+    docker-512m:
+      type: docker
+      memory: 512
+  strings:
+    - &dotnet-pipe-ref name/pipe-dotnet:1.0.2
+    - &dotnet-bnp-pipe-ref name/pipe-dotnet:2.0.0
+    - &git-versioner-pipe-ref name/pipe-git-versioner:1.0.13
+    - &postman-pipe-ref name/pipe-postman:1.1.0
+  scripts:
+    - &ecrLogin pip3 install awscli &&
+      AWS_ACCESS_KEY_ID=$DATAECR_AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY=$DATAECR_AWS_SECRET_ACCESS_KEY aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin xxdkr.ecr.us-east-1.amazonaws.com
+    - &gitversionProperties source gitversion.properties
+    - &exportSharedVars echo export BITBUCKET_DEPLOYMENT_ENVIRONMENT=$BITBUCKET_DEPLOYMENT_ENVIRONMENT >> shared_vars.sh
+    - &semver
+      pipe: *git-versioner-pipe-ref
+    - &build_only
+      pipe: *dotnet-pipe-ref
+      variables:
+        SONAR_TOKEN: $SONAR_TOKEN
+        SONAR_SERVER: $SONAR_SERVER
+        COVERAGE_REPORT_PATH: $COVERAGE_REPORT_PATH 
+        SLN_PATH: $SLN_PATH 
+        NUGET_CONFIG_PATH: $NUGET_CONFIG_PATH
+    - &build_and_publish
+      pipe: *dotnet-bnp-pipe-ref
+      variables:
+        SONAR_TOKEN: $SONAR_TOKEN
+        SONAR_SERVER: $SONAR_SERVER
+        COVERAGE_REPORT_PATH: $COVERAGE_REPORT_PATH 
+        SLN_PATH: $SLN_PATH 
+        NUGET_CONFIG_PATH: $NUGET_CONFIG_PATH
+        CSPROJ_PATH: $CSPROJ_PATH             
+    - &build_scan    
+      pipe: sonarsource/sonarqube-quality-gate:1.1.0
+      variables:
+        SONAR_TOKEN: $SONAR_TOKEN
+        REPORT_FILE: .sonarqube/out/.sonar/report-task.txt
+    - &postman_step
+      pipe: *postman-pipe-ref 
+      variables:
+        COMPONENT_FULLNAME: $COMPONENT_FULLNAME
+        ENDPOINT: $ENDPOINT
+        BITBUCKET_DEPLOYMENT_ENVIRONMENT: $BITBUCKET_DEPLOYMENT_ENVIRONMENTx``        
+steps:
+  - &semver-step
+    name: Semver Step
+    artifacts:
+      - gitversion.properties
+    script:
+      - *ecrLogin
+      - *semver
+    services:
+      - docker-512m
+  - &build-only
+    name: Build Only
+    runs-on:
+       - "self.hosted"
+       - "active"
+       - "linux"
+    caches:
+       - sonar
+    services:
+       - docker-4g 
+    artifacts:
+       - CodeCoverageReport/**
+       - UnitTestReport/**
+    script:
+      - *ecrLogin
+      - *build_only
+      - *build_scan
+  - &build-and-publish
+    name: Build and Publish
+    runs-on:
+          - "self.hosted"
+          - "active"
+          - "linux"
+    caches:
+       - sonar
+    services:
+      - docker-4g
+    artifacts:
+      - published/**
+    script:
+      - *ecrLogin
+      - *build_and_publish
+      - *build_scan
+  - &create-package
+    name: Create Package
+    artifacts:
+      - gitversion.properties
+      - out/**
+    services:
+      - docker-512m
+    script:
+      - *gitversionProperties
+      - pipe: octopusdeploy/octopus-cli-run:0.13.0
+        variables:
+          CLI_COMMAND: pack
+          ID: $BITBUCKET_REPO_SLUG
+          FORMAT: 'Zip'
+          VERSION: $GITVERSION_MAJORMINORPATCH.$BITBUCKET_BUILD_NUMBER
+          SOURCE_PATH: published
+          OUTPUT_PATH: ./out
+  - &push-package
+    name: Push Package
+    artifacts:
+      - gitversion.properties
+      -  "out/**"
+    services:
+      - docker-512m
+    script:
+      - *gitversionProperties
+      - pipe: octopusdeploy/octopus-cli-run:0.13.0
+        variables:
+          CLI_COMMAND: push
+          OCTOPUS_SERVER: $OCTOPUS_SERVER_EXT
+          OCTOPUS_APIKEY: $OCTOPUS_APIKEY
+          PROJECT: $BITBUCKET_REPO_SLUG
+          PACKAGES: "./out/$BITBUCKET_REPO_SLUG.$GITVERSION_MAJORMINORPATCH.$BITBUCKET_BUILD_NUMBER.zip"
+  - &create-release
+    name: Create Release & Deploy
+    artifacts:
+      - gitversion.properties
+      -  "out/**"
+      - shared_vars.sh
+    services:
+      - docker-512m
+    script:
+      - *gitversionProperties
+      - *exportSharedVars
+      - pipe: octopusdeploy/octopus-cli-run:0.13.0
+        variables:
+          CLI_COMMAND: create-release
+          OCTOPUS_SERVER: $OCTOPUS_SERVER_EXT
+          OCTOPUS_APIKEY: $OCTOPUS_APIKEY
+          PROJECT: $BITBUCKET_REPO_SLUG
+          RELEASE_NUMBER: $GITVERSION_MAJORMINORPATCH.$BITBUCKET_BUILD_NUMBER
+          EXTRA_ARGS: ['--deployTo', '$BITBUCKET_DEPLOYMENT_ENVIRONMENT', '--waitForDeployment', '--progress', '--guidedFailure', 'True', '--enableservicemessages']
+  - &postman-step
+    name: Execute Postman Integration Tests
+    runs-on:
+      - "self.hosted"
+      - "linux"
+      - "active"
+    script:
+      - *ecrLogin
+      - *exportSharedVars
+      - *postman_step 
+    artifacts:
+      - test/newman**
+pipelines:
+  branches:
+    master: 
+      - step: *build-only
+    nerds-dev:
+      - step: *semver-step
+      - step: *build-and-publish
+      - step: *create-package
+      - step: *push-package
+      - step:
+          <<: *create-release
+          deployment: DEV
+      - step: *postman-step
+    runts-dev:
+      - step: *semver-step
+      - step: *build-and-publish
+      - step: *create-package
+      - step: *push-package
+      - step:
+          <<: *create-release
+          deployment: QA
+      - step: *postman-step
+    patch:
+      - step: *semver-step
+      - step: *build-and-publish
+      - step: *create-package
+      - step: *push-package
+      - step:
+          <<: *create-release
+          deployment: PATCH
+      - step: *postman-step
+    cofy-dev:
+      - step: *semver-step
+      - step: *build-and-publish
+      - step: *create-package
+      - step: *push-package
+      - step:
+          <<: *create-release
+          deployment: COFY
+      - step: *postman-step
+    taco-dev:
+      - step: *semver-step
+      - step: *build-and-publish
+      - step: *create-package
+      - step: *push-package
+      - step:
+          <<: *create-release
+          deployment: TACO
+      - step: *postman-step
+  custom:
+    manual-deploy:
+      - variables:
+        - name: BITBUCKET_DEPLOYMENT_ENVIRONMENT
+          default: "DEV"
+          allowed-values:
+            - "COFY"
+            - "DEV"
+            - "GXD"
+            - "INT"
+            - "PATCH"
+            - "QA"
+            - "TACO"
+            - "UAT"
+      - step: *semver-step
+      - step: *build-and-publish
+      - step: *create-package
+      - step: *push-package
+      - step: *create-release
+      - step: *postman-step
+  pull-requests:
+    "**":
+      - step: *build-only

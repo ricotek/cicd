@@ -1,0 +1,161 @@
+### This is a template file for ci\cd (build\deploy) for bitbucket-cloud pipelines. 
+### The following vars have to be defined in the repo of the component that will be using this template: BUILD_CMD.
+### For this template to work with react your project must have tests enabled. NOTE: We might have to develop a newer version for use with react based projects. 
+### Development will take a few minutes to complete for react based projects
+options:
+  size: 2x
+image: python:3.7
+clone:
+  depth: full
+definitions:
+  services:
+    docker-6g:
+      type: docker
+      memory: 6656
+    docker-512m:
+      type: docker
+      memory: 512
+  strings:
+    - &js-ui-pipe-ref /pipe-js-ui:1.3.0
+    - &git-versioner-pipe-ref /pipe-git-versioner:1.0.13
+  scripts:
+    - &ecrLogin pip3 install awscli &&
+      AWS_ACCESS_KEY_ID=$DATAECR_AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY=$DATAECR_AWS_SECRET_ACCESS_KEY aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin xxdkr.ecr.us-east-1.amazonaws.com
+    - &setupEnv set -x &&
+      export REF_AWS_ACCESS_KEY_ID=DATAAWSCONFIG__${AWSACCOUNT}__AWS_ACCESS_KEY_ID &&
+      export REF_AWS_SECRET_ACCESS_KEY=DATAAWSCONFIG__${AWSACCOUNT}__AWS_SECRET_ACCESS_KEY &&
+      export REF_AWS_DEFAULT_REGION=DATAAWSCONFIG__AWS_DEFAULT_REGION &&
+      export AWS_ACCESS_KEY_ID=${!REF_AWS_ACCESS_KEY_ID} &&
+      export AWS_SECRET_ACCESS_KEY=${!REF_AWS_SECRET_ACCESS_KEY} &&
+      export AWS_DEFAULT_REGION=${!REF_AWS_DEFAULT_REGION} &&
+      export AWS_REGION=$AWS_DEFAULT_REGION &&
+      set +x
+    - &gitversionProperties source gitversion.properties
+    - &semver
+      pipe: *git-versioner-pipe-ref
+    - &build_only
+      pipe: *js-ui-pipe-ref
+      variables:
+        BUILD_CMD: $BUILD_CMD
+    - &build_scan    
+      pipe: sonarsource/sonarqube-scan:1.1.0
+      variables:
+        SONAR_HOST_URL: $SONAR_SERVER_EXT
+        SONAR_TOKEN: $SONAR_TOKEN
+        EXTRA_ARGS: -Dsonar.projectKey=$BITBUCKET_REPO_SLUG -Dsonar.typescript.lcov.reportPaths="./coverage/lcov.info" -Dsonar.branch.name=$BITBUCKET_BRANCH -Dsonar.exclusions=node_modules/*,Docker*,**/*.test.*,coverage/lcov.info,coverage/lcov-report/*  
+steps:
+  - &semver-step
+    name: Semver Step
+    artifacts:
+      - gitversion.properties
+    script:
+      - *ecrLogin
+      - *setupEnv
+      - *semver
+    services:
+      - docker-512m
+  - &build-only
+    name: Build Only
+    services:
+      - docker-6g 
+    artifacts:
+      - "coverage/**"
+    caches:
+      - pip
+      - docker
+    script:
+      - *ecrLogin
+      - *setupEnv
+      - *build_only
+      - *build_scan
+  - &build-and-publish
+    name: Build and Publish
+    services:
+      - docker-6g
+    artifacts:
+      - "dist/**"
+    caches:
+      - pip
+      - docker
+    script:
+      - *ecrLogin
+      - *setupEnv
+      - *build_only
+      - *build_scan
+  - &create-package
+    name: Create Package
+    artifacts:
+      - gitversion.properties
+      -  "dist/**"
+    services:
+      - docker-512m
+    script:
+      - *gitversionProperties
+      - pipe: octopusdeploy/octopus-cli-run:0.13.0
+        variables:
+          CLI_COMMAND: pack
+          ID: $BITBUCKET_REPO_SLUG
+          FORMAT: 'Zip'
+          VERSION: $GITVERSION_MAJORMINORPATCH.$BITBUCKET_BUILD_NUMBER
+          SOURCE_PATH: dist
+          OUTPUT_PATH: ./out
+    artifacts:
+     - "out/**"
+  - &push-package
+    name: Push Package
+    artifacts:
+      - gitversion.properties
+      -  "out/**"
+    services:
+      - docker-512m
+    script:
+      - *gitversionProperties
+      - pipe: octopusdeploy/octopus-cli-run:0.13.0
+        variables:
+          CLI_COMMAND: push
+          OCTOPUS_SERVER: $OCTOPUS_SERVER_EXT
+          OCTOPUS_APIKEY: $OCTOPUS_APIKEY
+          PROJECT: $BITBUCKET_REPO_SLUG
+          PACKAGES: "./out/$BITBUCKET_REPO_SLUG.$GITVERSION_MAJORMINORPATCH.$BITBUCKET_BUILD_NUMBER.zip"
+  - &create-release
+    name: Create Release & Deploy
+    artifacts:
+      - gitversion.properties
+      -  "out/**"
+    services:
+      - docker-512m
+    script:
+      - *gitversionProperties
+      - pipe: octopusdeploy/octopus-cli-run:0.13.0
+        variables:
+          CLI_COMMAND: create-release
+          OCTOPUS_SERVER: $OCTOPUS_SERVER_EXT
+          OCTOPUS_APIKEY: $OCTOPUS_APIKEY
+          PROJECT: $BITBUCKET_REPO_SLUG
+          RELEASE_NUMBER: $GITVERSION_MAJORMINORPATCH.$BITBUCKET_BUILD_NUMBER
+          EXTRA_ARGS: ['--deployTo', '$BITBUCKET_DEPLOYMENT_ENVIRONMENT', '--waitForDeployment', '--progress', '--guidedFailure', 'True', '--enableservicemessages']
+pipelines:
+  branches:
+    master: 
+      - step: *build-only
+  custom:
+    manual-deploy:
+      - variables:
+        - name: BITBUCKET_DEPLOYMENT_ENVIRONMENT
+          default: "DEV"
+          allowed-values:
+            - "COFY"
+            - "DEV"
+            - "INT"
+            - "PATCH"
+            - "QA"
+            - "TACO"
+            - "UAT"
+      - step: *semver-step
+      - step: *build-and-publish
+      - step: *create-package
+      - step: *push-package
+      - step: *create-release
+  pull-requests:
+    "**":
+      - step: *build-only

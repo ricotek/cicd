@@ -1,0 +1,252 @@
+### This is a template file for ci\cd (build\deploy) for bitbucket-cloud pipelines. 
+### The following vars have to be defined in the repo of the component that will be using this template:
+### $CHART_PATH, $COMPONENT, $COMPONENT_FULLNAME, $DOCKERFILE_PATH, $ECR_NAME, $ENDPOINT
+## NOTE: line 78, 142 & 154 deploy/vps-coracare--api/*.tgz is the only hard-coded value
+### All other variables that are common to all components (nuget path, sln path, etc...) have been added to the main project workspace in Bitbucket cloud
+options:
+  size: 2x
+image: python:3.7
+clone:
+  depth: full
+definitions:
+  caches:
+    sonar: ~/.sonar
+  services:
+    docker-4g:
+      type: docker
+      memory: 4096
+    docker-512m:
+      type: docker
+      memory: 512
+    docker-256m:
+      type: docker
+      memory: 256
+  strings:
+    - &dotnet-pipe-ref name/pipe-dotnet:1.0.2
+    - &docker-pipe-ref name/pipe-docker:1.0.5
+    - &git-versioner-pipe-ref name/pipe-git-versioner:1.0.13
+    - &helm-pipe-ref name/pipe-helm:1.3.2 # use with k8s v.1.24
+    - &postman-pipe-ref name/pipe-postman:1.0.4
+  scripts:
+    - &ecrLogin pip3 install awscli &&
+      AWS_ACCESS_KEY_ID=$DATAECR_AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY=$DATAECR_AWS_SECRET_ACCESS_KEY aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin xxdkr.ecr.us-east-1.amazonaws.com
+    - &gitversionProperties source gitversion.properties &&
+      export VERSION=$GITVERSION_MAJORMINORPATCH-$BITBUCKET_BUILD_NUMBER
+    - &exportSharedVars echo export BITBUCKET_DEPLOYMENT_ENVIRONMENT=$BITBUCKET_DEPLOYMENT_ENVIRONMENT >> shared_vars.sh &&
+      echo export ENV_SHORT_NAME=$ENV_SHORT_NAME >> shared_vars.sh
+    - &sharedVars source shared_vars.sh
+    - &semver
+      pipe: *git-versioner-pipe-ref
+    - &build_only
+      pipe: *dotnet-pipe-ref
+      variables:
+        SONAR_TOKEN: $SONAR_TOKEN
+        SONAR_SERVER: $SONAR_SERVER
+        COVERAGE_REPORT_PATH: $COVERAGE_REPORT_PATH 
+        SLN_PATH: $SLN_PATH 
+        NUGET_CONFIG_PATH: $NUGET_CONFIG_PATH
+    - &build_publish_tag
+      pipe: *docker-pipe-ref
+      variables:
+        COMPONENT_FULLNAME: $COMPONENT_FULLNAME
+        DOCKERFILE_PATH: $DOCKERFILE_PATH
+        ECR_NAME: $ECR_NAME      
+    - &build_scan    
+      pipe: sonarsource/sonarqube-quality-gate:1.1.0
+      variables:
+        SONAR_TOKEN: $SONAR_TOKEN
+        REPORT_FILE: .sonarqube/out/.sonar/report-task.txt
+    - &ecr_push
+      pipe: atlassian/aws-ecr-push-image:1.6.2
+      variables:
+        AWS_DEFAULT_REGION: us-east-1
+        AWS_OIDC_ROLE_ARN: 'arn:aws:iam::313424411561:role/au-bitbucket-role'
+        IMAGE_NAME: $BITBUCKET_REPO_SLUG
+        TAGS: ${VERSION}
+    - &helm_pack
+      pipe: *helm-pipe-ref
+      variables:
+        CHART_PATH: $CHART_PATH
+        VERSION: $GITVERSION_MAJORMINORPATCH-$BITBUCKET_BUILD_NUMBER
+    - &push_chart
+      pipe: octopusdeploy/octopus-cli-run:0.13.0
+      variables:
+        CLI_COMMAND: push
+        OCTOPUS_SERVER: $OCTOPUS_SERVER_EXT
+        OCTOPUS_APIKEY: $OCTOPUS_APIKEY
+        PROJECT: $BITBUCKET_REPO_SLUG.k8s
+        PACKAGES: deploy/vps-access-adverseevents-api/vps-access-adverseevents-api-$VERSION.tgz 
+    - &create_release
+      pipe: octopusdeploy/octopus-cli-run:0.13.0
+      variables:
+        CLI_COMMAND: create-release
+        OCTOPUS_SERVER: $OCTOPUS_SERVER_EXT
+        OCTOPUS_APIKEY: $OCTOPUS_APIKEY
+        PROJECT: $BITBUCKET_REPO_SLUG.k8s
+        RELEASE_NUMBER: $GITVERSION_MAJORMINORPATCH-$BITBUCKET_BUILD_NUMBER
+        EXTRA_ARGS: ['--deployTo', '$BITBUCKET_DEPLOYMENT_ENVIRONMENT', '--waitForDeployment', '--progress', '--guidedFailure', 'True', '--enableservicemessages']
+    - &postman_step
+      pipe: *postman-pipe-ref
+      variables:
+        COMPONENT_FULLNAME: $COMPONENT_FULLNAME
+        ENDPOINT: $ENDPOINT
+        BITBUCKET_DEPLOYMENT_ENVIRONMENT: $BITBUCKET_DEPLOYMENT_ENVIRONMENT
+        ENV_SHORT_NAME: $ENV_SHORT_NAME
+steps:
+  - &semver-step
+    name: Generate semantic version
+    artifacts:
+      - gitversion.properties
+    script:
+      - *ecrLogin
+      - *semver
+    services:
+      - docker-256m
+  - &build-only
+    name: Build Only
+    runs-on:
+       - "self.hosted"
+       - "active"
+       - "linux"
+    caches:
+       - sonar
+    services:
+       - docker-4g 
+    artifacts:
+       - CodeCoverageReport/**
+       - UnitTestReport/**
+    script:
+      - *ecrLogin
+      - *build_only
+      - *build_scan
+  - &build-publish-tag
+    oidc: true
+    name: Build docker image & push
+    artifacts:
+      - gitversion.properties
+    runs-on:
+          - "self.hosted"
+          - "active"
+          - "linux"
+    services:
+      - docker-4g
+    script:
+      - *ecrLogin
+      - *gitversionProperties
+      - *build_publish_tag
+      - *ecr_push
+  - &helm-pack
+    oidc: true
+    name: Helm pack & push
+    artifacts:
+      - deploy/vps-access-adverseevents-api/*.tgz
+    services:
+      - docker-256m
+    script:
+      - *ecrLogin
+      - *gitversionProperties
+      - *helm_pack
+      - *push_chart
+  - &create-release
+    name: Create release & deploy
+    artifacts:
+      - gitversion.properties
+      - deploy/vps-access-adverseevents-api/*.tgz
+      - shared_vars.sh
+    services:
+      - docker-256m
+    script:
+      - *gitversionProperties
+      - *create_release
+      - *exportSharedVars
+  - &postman-step
+    name: Execute postman integration tests
+    runs-on:
+      - "self.hosted"
+      - "linux"
+      - "active"
+    services:
+      - docker-256m
+    script:
+      - *ecrLogin
+      - *sharedVars
+      - *postman_step
+    artifacts:
+      - test/newman**
+pipelines:
+  branches:
+    master: 
+      - step: *build-only
+    nerds-dev:
+      - step: *semver-step
+      - step: *build-publish-tag
+      - step: *helm-pack
+      - step:
+          <<: *create-release
+          deployment: DEV
+      - step: *postman-step
+    runts-dev:
+      - step: *semver-step
+      - step: *build-publish-tag
+      - step: *helm-pack
+      - step:
+          <<: *create-release
+          deployment: QA
+      - step: *postman-step
+    patch:     
+      - step: *semver-step
+      - step: *build-publish-tag
+      - step: *helm-pack
+      - step:
+          <<: *create-release
+          deployment: PATCH
+      - step: *postman-step
+    cofy-dev:
+      - step: *semver-step
+      - step: *build-publish-tag
+      - step: *helm-pack
+      - step:
+          <<: *create-release
+          deployment: COFY
+      - step: *postman-step
+    taco-dev:
+      - step: *semver-step
+      - step: *build-publish-tag
+      - step: *helm-pack
+      - step:
+          <<: *create-release
+          deployment: TACO
+      - step: *postman-step
+  custom:
+    manual-deploy:
+      - variables:
+        - name: ENV_SHORT_NAME
+          default: "dev"
+          allowed-values:
+            - "cofy"
+            - "dev"
+            - "gxd"
+            - "int"
+            - "pat"
+            - "qa"
+            - "stg"
+            - "taco"
+        - name: BITBUCKET_DEPLOYMENT_ENVIRONMENT
+          default: "DEV"
+          allowed-values:
+            - "COFY"
+            - "DEV"
+            - "GXD"
+            - "INT"
+            - "PATCH"
+            - "QA"
+            - "TACO"
+            - "UAT"
+      - step: *semver-step
+      - step: *build-publish-tag
+      - step: *helm-pack
+      - step: *create-release
+      - step: *postman-step
+  pull-requests:
+    "**":
+      - step: *build-only
