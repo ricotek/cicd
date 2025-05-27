@@ -1,0 +1,198 @@
+trigger:
+  branches:
+    include:
+      - main
+
+# Pull secrets from Azure Key Vault via variable group
+variables:
+  - group: shared-secrets  # Includes: F5_USER, F5_PASSWORD, OCTOPUS_API_KEY.
+
+parameters:
+  - name: environment
+    displayName: 'Environment to deploy to'
+    type: string
+    default: 'dev'
+    values:
+      - dev
+      - test
+      - prod
+
+  - name: deployDatabase
+    displayName: 'Run DB Deployment?'
+    type: boolean
+    default: false
+
+  - name: buildVersion
+    type: string
+    default: '$(Build.BuildId)'
+
+# App-specific vars
+variables:
+  artifactName: 'webapp'
+  buildConfiguration: 'Release'
+  solution: '**/*.sln'
+  octopusServer: 'https://octopus.freedompay.com'
+  octopusProject: 'webapp'
+
+stages:
+# --------------------
+# BUILD STAGE
+# --------------------
+  - stage: Build
+    displayName: 'Build & Package'
+    jobs:
+      - job: BuildJob
+        pool:
+          vmImage: 'windows-latest'
+        steps:
+          - task: UseDotNet@2
+            inputs:
+              packageType: 'sdk'
+              version: '6.0.x'
+
+          - task: NuGetToolInstaller@1
+
+          - task: NuGetCommand@2
+            inputs:
+              restoreSolution: '$(solution)'
+
+          - task: VSBuild@1
+            inputs:
+              solution: '$(solution)'
+              configuration: '$(buildConfiguration)'
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Publish'
+            inputs:
+              command: 'publish'
+              publishWebProjects: true
+              arguments: '--configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)/drop'
+              zipAfterPublish: true
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)/drop'
+              ArtifactName: '$(artifactName)'
+
+# --------------------
+# DEPLOYMENT STAGE
+# --------------------
+  - stage: Deploy
+    displayName: 'Deploy to ${{ parameters.environment }}'
+    dependsOn: Build
+    condition: succeeded()
+    environment: ${{ parameters.environment }}  # 🔐 Triggers approval if required
+    jobs:
+      - job: DeployJob
+        pool:
+          vmImage: 'windows-latest'
+        steps:
+          - task: DownloadBuildArtifacts@0
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: '$(artifactName)'
+              downloadPath: '$(Pipeline.Workspace)/$(artifactName)'
+
+          - task: PowerShell@2
+            displayName: 'Rolling Deploy with F5 Integration & Health Check'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $ErrorActionPreference = "Stop"
+
+                $octopusServer = "$(octopusServer)"
+                $octopusApiKey = "$(OCTOPUS_API_KEY)"
+                $project = "$(octopusProject)"
+                $version = "${{ parameters.buildVersion }}"
+                $environment = "${{ parameters.environment }}"
+                $packagePath = "$(Pipeline.Workspace)/$(artifactName)/**/*.zip"
+                $f5User = "$(F5_USER)"
+                $f5Password = "$(F5_PASSWORD)"
+                $poolName = "MyAppPool"
+
+                $nodes = @(
+                  @{ name = "iis01"; ip = "10.0.0.1"; fqdn = "iis01.internal.mycompany.com" },
+                  @{ name = "iis02"; ip = "10.0.0.2"; fqdn = "iis02.internal.mycompany.com" },
+                  @{ name = "iis03"; ip = "10.0.0.3"; fqdn = "iis03.internal.mycompany.com" },
+                  @{ name = "iis04"; ip = "10.0.0.4"; fqdn = "iis04.internal.mycompany.com" },
+                  @{ name = "iis05"; ip = "10.0.0.5"; fqdn = "iis05.internal.mycompany.com" }
+                )
+
+                function Disable-F5Node($ip) {
+                  Write-Host "🔻 Disabling F5 node $ip..."
+                  $uri = "https://f5.mycompany.com/mgmt/tm/ltm/pool/~Common~$poolName/members/~Common~$ip:80"
+                  $body = '{"session":"user-disabled","state":"user-down"}'
+                  Invoke-RestMethod -Method Patch -Uri $uri -Body $body -ContentType "application/json" -UseBasicParsing -Credential (New-Object PSCredential($f5User, (ConvertTo-SecureString $f5Password -AsPlainText -Force)))
+                }
+
+                function Enable-F5Node($ip) {
+                  Write-Host "✅ Enabling F5 node $ip..."
+                  $uri = "https://f5.mycompany.com/mgmt/tm/ltm/pool/~Common~$poolName/members/~Common~$ip:80"
+                  $body = '{"session":"user-enabled","state":"user-up"}'
+                  Invoke-RestMethod -Method Patch -Uri $uri -Body $body -ContentType "application/json" -UseBasicParsing -Credential (New-Object PSCredential($f5User, (ConvertTo-SecureString $f5Password -AsPlainText -Force)))
+                }
+
+                function Test-WebHealth($fqdn) {
+                  $timeoutSeconds = 90
+                  $elapsed = 0
+                  while ($elapsed -lt $timeoutSeconds) {
+                    try {
+                      $response = Invoke-WebRequest -Uri "http://$fqdn" -UseBasicParsing -TimeoutSec 10
+                      if ($response.StatusCode -eq 200) {
+                        Write-Host "🟢 Health check passed on $fqdn"
+                        return $true
+                      } else {
+                        Write-Host "⚠️ Status $($response.StatusCode) from $fqdn"
+                      }
+                    } catch {
+                      Write-Host "🔄 Waiting for $fqdn to respond..."
+                    }
+                    Start-Sleep -Seconds 5
+                    $elapsed += 5
+                  }
+                  Write-Host "❌ Health check failed on $fqdn after $timeoutSeconds seconds"
+                  return $false
+                }
+
+                Write-Host "📦 Pushing package to Octopus..."
+                & octo push `
+                  --server $octopusServer `
+                  --apiKey $octopusApiKey `
+                  --package "$packagePath" `
+                  --replace-existing
+
+                Write-Host "🚀 Creating release $version..."
+                & octo create-release `
+                  --server $octopusServer `
+                  --apiKey $octopusApiKey `
+                  --project "$project" `
+                  --version "$version" `
+                  --packageVersion "$version"
+
+                foreach ($node in $nodes) {
+                  $ip = $node.ip
+                  $name = $node.name
+                  $fqdn = $node.fqdn
+
+                  Disable-F5Node -ip $ip
+
+                  Write-Host "🚀 Deploying to Octopus target: $name"
+                  & octo deploy-release `
+                    --server $octopusServer `
+                    --apiKey $octopusApiKey `
+                    --project "$project" `
+                    --version "$version" `
+                    --deployTo "$environment" `
+                    --specificMachines "$name" `
+                    --progress `
+                    --waitForDeployment
+
+                  Write-Host "🧪 Performing health check on $fqdn..."
+                  if (Test-WebHealth -fqdn $fqdn) {
+                    Enable-F5Node -ip $ip
+                  } else {
+                    Write-Error "💥 Health check failed for $fqdn. Not re-enabling node in F5."
+                    # Optional: exit 1
+                  }
+                }
