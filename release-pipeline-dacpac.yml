@@ -1,0 +1,175 @@
+pr:
+  branches:
+    include:
+      - '*' # All branches
+trigger:
+  none
+
+variables:
+
+  - name: azureSubscription
+    value: 'Pay-As-You-Go Dev/Test - IaC'
+  
+  - name: azureSubscriptionQa
+    value: 'QA-ADO'
+
+  - name: azureSubscriptionProd
+    value: 'PROD-ADO'
+
+  - name: solution 
+    value: 'JobService/Actabl.BI.Jobs.Db/Actabl.BI.Jobs.Db.sqlproj'
+
+  - name: buildConfiguration
+    value: 'Release'
+  
+  - name: dacpacFile
+    value: '$(Build.ArtifactStagingDirectory)/**/*.dacpac'
+
+  - name: databaseName
+    value: 'bi-job-service-dev01' 
+
+  - name: ServerName
+    value: 'dev-sqlaz-ps01.database.windows.net'
+
+parameters:
+  - name: selectedEnv
+    displayName: 'Select the deployment environment.'
+    type: string
+    values:
+      - 'bi-job-service-dev01'
+      - 'bi-job-service-test01'
+      - 'bi-job-service-qa01'
+      - 'bi-job-service-client-qa01'
+      - 'bi-job-service-rc01'
+      - 'bi-job-service-lt01'
+      - 'bi-job-service-prod01'
+      - 'bi-job-service-prod02'
+      - 'bi-job-service-prod03'
+    default: 'bi-job-service-dev01'
+
+  - name: subscription
+    displayName: "Select an Azure Subscription"
+    type: string
+    default: dev-test
+    values:
+      - dev-test
+      - qa
+      - prod
+
+stages:
+  - stage: BuildAndPublishArtifacts
+    displayName: 'Build & Publish Artifacts'
+    condition: always()
+    pool:
+      vmImage: 'windows-latest'  # Use a Windows agent for SSDT and SQL projects 
+    jobs:
+      - job: Build
+        displayName: 'Build SQL Project'
+        steps:
+        - task: PowerShell@2
+          displayName: 'Download vswhere'
+          inputs:
+            targetType: 'inline'
+            script: |
+              Write-Host "🔄 Downloading vswhere..."
+              $vswhereUrl = "https://github.com/microsoft/vswhere/releases/latest/download/vswhere.exe"
+              $vswherePath = "$env:TEMP\vswhere.exe"
+              Invoke-WebRequest -Uri $vswhereUrl -OutFile $vswherePath
+              Write-Host "✅ vswhere downloaded to: $vswherePath"
+
+        - task: PowerShell@2
+          displayName: 'Install Visual Studio Build Tools and SSDT'
+          inputs:
+            targetType: 'inline'
+            script: |
+              Write-Host "🔄 Downloading Visual Studio Build Tools..."
+              $vsInstallerUrl = "https://aka.ms/vs/17/release/vs_buildtools.exe"
+              $vsInstallerPath = "$env:TEMP\vs_buildtools.exe"
+              Invoke-WebRequest -Uri $vsInstallerUrl -OutFile $vsInstallerPath
+
+              Write-Host "🔄 Installing Visual Studio Build Tools and SSDT..."
+              Start-Process -Wait -FilePath $vsInstallerPath -ArgumentList `
+                "--quiet --wait --norestart --nocache --installPath `"C:\VS2022`" `
+                --add Microsoft.VisualStudio.Workload.DataBuildTools `
+                --add Microsoft.VisualStudio.Component.SQL.SSDT `
+                --add Microsoft.VisualStudio.Component.SQL.SSDT.BuildTools `
+                --add Microsoft.VisualStudio.Component.SQL.SSDT.MSBuild `
+                --add Microsoft.VisualStudio.Component.SQL.LocalDB `
+                --add Microsoft.VisualStudio.Component.SQL.DataSources `
+                --add Microsoft.VisualStudio.Component.SQL.CLR `
+                --add Microsoft.VisualStudio.Component.Data.Tools `
+                --add Microsoft.VisualStudio.Component.Data.Sql.BuildTools `
+                --add Microsoft.VisualStudio.Component.SQL.Server.Data.Tools `
+                --add Microsoft.VisualStudio.Workload.ManagedDesktopBuildTools `
+                --add Microsoft.VisualStudio.Workload.NetCoreBuildTools" -NoNewWindow
+
+              Write-Host "✅ Visual Studio Build Tools and SSDT installation complete!"
+
+        - task: PowerShell@2
+          displayName: 'List Installed Visual Studio Components'
+          inputs:
+            targetType: 'inline'
+            script: |
+              Write-Host "🔄 Listing installed Visual Studio components..."
+              $vswherePath = "$env:TEMP\vswhere.exe"
+              if (Test-Path $vswherePath) {
+                  & $vswherePath -latest -products * -requires Microsoft.VisualStudio.Component.SQL.SSDT -property productLineVersion, installationPath
+              } else {
+                  Write-Host "❌ vswhere.exe not found! Cannot list installed components."
+              }
+
+        - task: PowerShell@2
+          displayName: 'Set SSDT Path for MSBuild'
+          inputs:
+            targetType: 'inline'
+            script: |
+              Write-Host "🔄 Setting SSDT Path..."
+
+              $vswherePath = "$env:TEMP\vswhere.exe"
+              if (-Not (Test-Path $vswherePath)) {
+                  Write-Host "❌ vswhere.exe not found! Cannot check SSDT installation."
+                  exit 1
+              }
+
+              # Find Visual Studio installation path
+              $vsInstallPath = & $vswherePath -latest -products * -property installationPath
+              if (-not $vsInstallPath) {
+                  Write-Host "❌ Visual Studio installation not found."
+                  exit 1
+              }
+
+              # Look for SSDT inside the Visual Studio installation
+              $ssdtPath = "$vsInstallPath\MSBuild\Microsoft\VisualStudio\v17.0\SSDT"
+              if (Test-Path $ssdtPath) {
+                  Write-Host "✅ SSDT FOUND at: $ssdtPath"
+                  echo "##vso[task.setvariable variable=SSDTPath]$ssdtPath"
+              } else {
+                  Write-Host "❌ SSDT not found at expected path: $ssdtPath"
+                  Write-Host "⚠ Check the pipeline logs to verify installed components."
+                  exit 1
+              }
+
+        - task: NuGetCommand@2
+          displayName: 'NuGet Restore'
+          inputs:
+            restoreSolution: '$(solution)'
+            feedsToUse: 'select'
+            includeNuGetOrg: true
+            verbosity: 'Detailed'
+            msbuildPath: 'C:\VS2022\MSBuild\Current\Bin\MSBuild.exe'
+
+        - task: MSBuild@1
+          displayName: 'Build the Project'
+          inputs:
+            solution: '$(solution)'
+            configuration: '$(buildConfiguration)'
+            msbuildArguments: '/p:NetCoreBuild=true /p:VisualStudioVersion=17.0 /p:SQLDBExtensionsPath="$(SSDTPath)"'
+            msbuildPath: 'C:\VS2022\MSBuild\Current\Bin\MSBuild.exe'
+            restoreNugetPackages: true
+
+        - task: PublishBuildArtifacts@1
+          displayName: 'Publish Artifact'
+          inputs:
+            PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+            ArtifactName: 'dacpac'
+            publishLocation: 'Container'
